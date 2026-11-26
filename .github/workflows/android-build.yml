@@ -1,12 +1,14 @@
-name: MISTY - Auto Extract and Build APK
+name: MISTY Android - Auto Extract, Verify and Build
 
 on:
   push:
     branches: [main, master]
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:
     inputs:
       source_zip:
-        description: 'Optional ZIP path/name in the repository (blank = auto-detect)'
+        description: "Optional ZIP path/name in repository (blank = auto-detect)"
         required: false
         type: string
 
@@ -19,32 +21,30 @@ concurrency:
 
 jobs:
   build:
-    name: Extract Android project and build APK
+    name: Extract, verify and build MISTY APK
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       REQUESTED_SOURCE_ZIP: ${{ inputs.source_zip }}
 
     steps:
-      - name: Checkout repository (including committed ZIP)
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Set up JDK 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
+          cache: gradle
 
-      # v4 avoids the removed legacy Android SDK "tools" package.
-      - name: Set up Android SDK command-line tools
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v4
-        with:
-          packages: platform-tools
 
-      - name: Find and safely extract Android source ZIP
-        id: source
+      - name: Find and safely extract Android project
+        id: project
         shell: bash
         run: |
           set -euo pipefail
@@ -52,171 +52,233 @@ jobs:
           import os, re, shutil, zipfile
           from pathlib import Path, PurePosixPath
 
-          repo = Path(os.environ['GITHUB_WORKSPACE']).resolve()
-          out = Path(os.environ['RUNNER_TEMP']) / 'misty-project'
-          requested = os.environ.get('REQUESTED_SOURCE_ZIP', '').strip()
+          repo = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          temp = Path(os.environ["RUNNER_TEMP"]) / "misty-source"
+          requested = os.environ.get("REQUESTED_SOURCE_ZIP", "").strip()
 
-          def find_project_prefix(names):
-              files = {str(PurePosixPath(n)) for n in names if n and not n.endswith('/')}
-              for item in sorted(files):
-                  p = PurePosixPath(item)
-                  if p.name != 'gradlew':
+          def has_project(entries):
+              names = {str(PurePosixPath(x)) for x in entries if x and not x.endswith("/")}
+              for name in names:
+                  p = PurePosixPath(name)
+                  if p.name not in ("settings.gradle", "settings.gradle.kts"):
                       continue
                   root = p.parent
-                  settings = (str(root / 'settings.gradle') in files or
-                              str(root / 'settings.gradle.kts') in files)
-                  app_gradle = (str(root / 'app/build.gradle') in files or
-                                str(root / 'app/build.gradle.kts') in files)
-                  wrapper = str(root / 'gradle/wrapper/gradle-wrapper.jar') in files
-                  if settings and app_gradle and wrapper:
-                      return root
-              return None
+                  if (str(root / "app/build.gradle") in names or
+                      str(root / "app/build.gradle.kts") in names):
+                      return True
+              return False
 
-          candidates = []
-          for z in repo.rglob('*.zip'):
-              if '.git' in z.parts or not z.is_file():
+          zips = []
+          for z in repo.rglob("*.zip"):
+              if ".git" in z.parts or not z.is_file():
                   continue
               try:
                   with zipfile.ZipFile(z) as archive:
-                      prefix = find_project_prefix(archive.namelist())
-                      if prefix is not None:
-                          candidates.append((z, prefix, len(archive.namelist())))
+                      if archive.testzip() is None and has_project(archive.namelist()):
+                          zips.append(z)
               except (zipfile.BadZipFile, OSError):
-                  print(f'Skipping invalid ZIP: {z.relative_to(repo)}')
+                  print(f"Skipping invalid ZIP: {z.relative_to(repo)}")
 
           chosen = None
           if requested:
-              matches = [c for c in candidates
-                         if str(c[0].relative_to(repo)) == requested or c[0].name == requested]
+              matches = [z for z in zips
+                         if str(z.relative_to(repo)) == requested or z.name == requested]
               if not matches:
-                  raise SystemExit(f'Selected ZIP not found or not a complete Android project: {requested}')
-              chosen = max(matches, key=lambda c: c[2])
-          elif candidates:
-              # Prefer the explicitly recommended filename, then a MISTY/Jarvis/Android name.
-              def score(c):
-                  name = c[0].name.lower()
-                  exact = name == 'misty-android-project.zip'
-                  branded = bool(re.search(r'misty|jarvis|android|source', name))
-                  return (exact, branded, c[2], c[0].stat().st_size)
-              chosen = max(candidates, key=score)
+                  raise SystemExit(
+                      f"Requested ZIP not found or does not contain a Gradle Android app: {requested}"
+                  )
+              chosen = matches[0]
+          elif zips:
+              chosen = sorted(
+                  zips,
+                  key=lambda z: (
+                      z.name.lower() == "misty-android-project.zip",
+                      any(k in z.name.lower() for k in ("misty", "android", "source")),
+                      z.stat().st_size
+                  ),
+                  reverse=True
+              )[0]
 
-          shutil.rmtree(out, ignore_errors=True)
-          out.mkdir(parents=True, exist_ok=True)
+          shutil.rmtree(temp, ignore_errors=True)
+          temp.mkdir(parents=True, exist_ok=True)
 
           if chosen:
-              archive_path, prefix, _ = chosen
-              print(f'Selected source ZIP: {archive_path.relative_to(repo)}')
-              print(f'Project root inside ZIP: {prefix}')
-              with zipfile.ZipFile(archive_path) as archive:
+              print(f"Selected source archive: {chosen.relative_to(repo)}")
+              with zipfile.ZipFile(chosen) as archive:
                   for info in archive.infolist():
                       member = PurePosixPath(info.filename)
-                      if member.is_absolute() or '..' in member.parts:
-                          raise SystemExit(f'Refusing unsafe ZIP entry: {info.filename}')
-                      destination = (out / Path(*member.parts)).resolve()
-                      if out.resolve() not in destination.parents and destination != out.resolve():
-                          raise SystemExit(f'Refusing unsafe ZIP destination: {info.filename}')
+                      if member.is_absolute() or ".." in member.parts:
+                          raise SystemExit(f"Unsafe ZIP entry rejected: {info.filename}")
+                      destination = (temp / Path(*member.parts)).resolve()
+                      if temp.resolve() not in destination.parents and destination != temp.resolve():
+                          raise SystemExit(f"Unsafe ZIP destination rejected: {info.filename}")
                       if info.is_dir():
                           destination.mkdir(parents=True, exist_ok=True)
                       else:
                           destination.parent.mkdir(parents=True, exist_ok=True)
-                          with archive.open(info) as src, destination.open('wb') as dst:
+                          with archive.open(info) as src, destination.open("wb") as dst:
                               shutil.copyfileobj(src, dst)
-              project = (out / Path(*prefix.parts)).resolve()
+              search_root = temp
           else:
-              # Fallback: build a project that was already extracted and committed to the repo.
-              print('No valid source ZIP found; checking extracted project files.')
-              wrappers = [p for p in repo.rglob('gradlew')
-                          if '.git' not in p.parts and 'build' not in p.parts]
-              if not wrappers:
-                  raise SystemExit('No complete Android ZIP or gradlew found. Upload and commit the Android project ZIP to the repository root.')
-              project = wrappers[0].parent
+              print("No valid Android ZIP detected; checking already-extracted repository files.")
+              search_root = repo
 
-          required = [
-              project / 'gradlew',
-              project / 'gradle/wrapper/gradle-wrapper.jar',
-              project / 'gradle/wrapper/gradle-wrapper.properties',
-              project / 'app/build.gradle.kts',
-              project / 'app/src/main/AndroidManifest.xml',
-          ]
-          settings_ok = ((project / 'settings.gradle').is_file() or
-                         (project / 'settings.gradle.kts').is_file())
-          missing = [str(p.relative_to(project)) for p in required if not p.is_file()]
-          if not settings_ok:
-              missing.append('settings.gradle(.kts)')
-          if missing:
-              raise SystemExit('Incomplete Android project. Missing: ' + ', '.join(missing))
+          candidates = []
+          for settings in search_root.rglob("settings.gradle*"):
+              if ".git" in settings.parts or "build" in settings.parts:
+                  continue
+              root = settings.parent
+              if (root / "app/build.gradle").is_file() or (root / "app/build.gradle.kts").is_file():
+                  candidates.append(root)
 
-          os.chmod(project / 'gradlew', 0o755)
-          with open(os.environ['GITHUB_ENV'], 'a') as env:
-              env.write(f'MISTY_PROJECT_DIR={project}\n')
-          print(f'Validated Android project at: {project}')
+          if not candidates:
+              raise SystemExit(
+                  "No Android Gradle project found. ZIP must contain settings.gradle(.kts) "
+                  "and app/build.gradle(.kts)."
+              )
+
+          project = sorted(candidates, key=lambda p: (len(p.parts), str(p)))[0]
+          wrapper = project / "gradlew"
+          wrapper_props = project / "gradle/wrapper/gradle-wrapper.properties"
+          wrapper_jar = project / "gradle/wrapper/gradle-wrapper.jar"
+
+          if wrapper.is_file() and wrapper_props.is_file() and wrapper_jar.is_file():
+              gradle_cmd = "./gradlew"
+              text = wrapper_props.read_text(errors="replace")
+              match = re.search(r"gradle-([0-9][0-9A-Za-z.+-]*)-(?:bin|all)\.zip", text)
+              gradle_version = match.group(1) if match else "8.7"
+              os.chmod(wrapper, 0o755)
+              print("Using the project's complete Gradle wrapper.")
+          else:
+              gradle_cmd = "gradle"
+              gradle_version = "8.7"
+              print(
+                  "::warning::Gradle wrapper is missing/incomplete. "
+                  "Using Gradle 8.7 as a fallback; wrapper should be committed for reproducible builds."
+              )
+
+          gradle_files = list(project.rglob("*.gradle")) + list(project.rglob("*.gradle.kts"))
+          gradle_text = "\n".join(p.read_text(errors="ignore") for p in gradle_files)
+          compile_sdks = re.findall(r"(?:compileSdk(?:Version)?\s*(?:=\s*)?)(\d+)", gradle_text)
+          compile_sdk = max(map(int, compile_sdks), default=35)
+
+          ndk_matches = re.findall(r'ndkVersion\s*(?:=\s*)*"([^"]+)"', gradle_text)
+          needs_cmake = "externalNativeBuild" in gradle_text or "cmake" in gradle_text.lower()
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"project_dir={project}\n")
+              f.write(f"gradle_cmd={gradle_cmd}\n")
+              f.write(f"gradle_version={gradle_version}\n")
+              f.write(f"compile_sdk={compile_sdk}\n")
+              if ndk_matches:
+                  f.write(f"ndk_version={ndk_matches[0]}\n")
+              f.write(f"needs_cmake={str(needs_cmake).lower()}\n")
+
+          print(f"Android project root: {project}")
+          print(f"Compile SDK detected: android-{compile_sdk}")
+          print(f"Gradle command: {gradle_cmd} (Gradle {gradle_version})")
+          print("Project structure check passed.")
           PY
-
-      - name: Install Android SDK, NDK and CMake required by this source
-        shell: bash
-        run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null
-          install_android_packages() {
-            sdkmanager --install \
-              "platforms;android-35" \
-              "build-tools;35.0.0" \
-              "platform-tools" \
-              "ndk;27.0.12077973" \
-              "cmake;3.22.1"
-          }
-          for attempt in 1 2 3; do
-            if install_android_packages; then
-              exit 0
-            fi
-            echo "SDK installation attempt ${attempt} failed; retrying..."
-            sleep $((attempt * 10))
-          done
-          echo 'Android SDK/NDK/CMake installation failed after 3 attempts.'
-          exit 1
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.project.outputs.gradle_version }}
 
-      - name: Verify Gradle wrapper
+      - name: Accept Android SDK licenses and install required platform
         shell: bash
+        env:
+          COMPILE_SDK: ${{ steps.project.outputs.compile_sdk }}
+          NDK_VERSION: ${{ steps.project.outputs.ndk_version }}
+          NEEDS_CMAKE: ${{ steps.project.outputs.needs_cmake }}
         run: |
           set -euo pipefail
-          cd "$MISTY_PROJECT_DIR"
-          chmod +x ./gradlew
-          test -s gradle/wrapper/gradle-wrapper.jar
-          test -s gradle/wrapper/gradle-wrapper.properties
-          echo 'Gradle wrapper files verified.'
-          cat gradle/wrapper/gradle-wrapper.properties
 
-      - name: Build MISTY Debug APK
-        id: apk
+          # Avoid a harmless SIGPIPE from `yes` failing the whole pipeline.
+          set +e
+          yes | sdkmanager --licenses >/tmp/misty-sdk-licenses.log 2>&1
+          sdkmanager_status=${PIPESTATUS[1]}
+          set -e
+          cat /tmp/misty-sdk-licenses.log
+          if [ "$sdkmanager_status" -ne 0 ]; then
+            echo "sdkmanager --licenses failed with exit code $sdkmanager_status"
+            exit "$sdkmanager_status"
+          fi
+
+          packages=("platform-tools" "platforms;android-${COMPILE_SDK}")
+          if [ -n "${NDK_VERSION:-}" ]; then
+            packages+=("ndk;${NDK_VERSION}")
+          fi
+          if [ "${NEEDS_CMAKE:-false}" = "true" ]; then
+            packages+=("cmake;3.22.1")
+          fi
+
+          for attempt in 1 2 3; do
+            if sdkmanager --install "${packages[@]}"; then
+              exit 0
+            fi
+            echo "Android SDK install attempt ${attempt} failed."
+            sleep $((attempt * 10))
+          done
+          echo "Android SDK package installation failed after 3 attempts."
+          exit 1
+
+      - name: Verify project and Gradle files
         shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
         run: |
           set -euo pipefail
-          cd "$MISTY_PROJECT_DIR"
-          ./gradlew --no-daemon --stacktrace --max-workers=2 clean assembleDebug
-          test -n "$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -type f -print -quit)"
-          echo 'APK build completed.'
+          cd "$PROJECT_DIR"
+          test -f settings.gradle || test -f settings.gradle.kts
+          test -f app/build.gradle || test -f app/build.gradle.kts
+          if [ -x ./gradlew ]; then
+            test -s gradle/wrapper/gradle-wrapper.jar
+            test -s gradle/wrapper/gradle-wrapper.properties
+          fi
+          echo "Android project structure verified."
 
-      - name: Run unit tests (reported separately)
+      - name: Build Debug APK
+        id: build
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
+          GRADLE_CMD: ${{ steps.project.outputs.gradle_cmd }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          "$GRADLE_CMD" --no-daemon --stacktrace --max-workers=2 clean assembleDebug
+
+          mkdir -p "$RUNNER_TEMP/misty-apks"
+          find . -type f -path "*/build/outputs/apk/*/*.apk" -print -exec cp {} "$RUNNER_TEMP/misty-apks/" \;
+          if ! find "$RUNNER_TEMP/misty-apks" -maxdepth 1 -type f -name "*.apk" | grep -q .; then
+            echo "Gradle finished but no APK was produced."
+            exit 1
+          fi
+          echo "APK files generated:"
+          ls -lh "$RUNNER_TEMP/misty-apks"
+
+      - name: Run unit tests
         if: success()
         continue-on-error: true
         shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
+          GRADLE_CMD: ${{ steps.project.outputs.gradle_cmd }}
         run: |
-          cd "$MISTY_PROJECT_DIR"
-          ./gradlew --no-daemon --stacktrace --max-workers=2 testDebugUnitTest
+          cd "$PROJECT_DIR"
+          "$GRADLE_CMD" --no-daemon --stacktrace --max-workers=2 testDebugUnitTest
 
       - name: Upload MISTY APK
-        if: steps.apk.outcome == 'success'
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: MISTY-Android-APK
-          path: ${{ env.MISTY_PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          path: ${{ runner.temp }}/misty-apks/*.apk
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload diagnostic reports if build fails
+      - name: Upload build diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
